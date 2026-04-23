@@ -7,8 +7,8 @@ import os from 'os';
 
 import { log } from './log.js';
 
-/** The container runtime binary name. */
-export const CONTAINER_RUNTIME_BIN = 'docker';
+/** The container runtime binary name. Defaults to docker; set CONTAINER_RUNTIME=podman to use Podman. */
+export const CONTAINER_RUNTIME_BIN = process.env.CONTAINER_RUNTIME || 'docker';
 
 /** CLI args needed for the container to resolve the host gateway. */
 export function hostGatewayArgs(): string[] {
@@ -46,8 +46,8 @@ export function ensureContainerRuntimeRunning(): void {
     console.error('║  FATAL: Container runtime failed to start                      ║');
     console.error('║                                                                ║');
     console.error('║  Agents cannot run without a container runtime. To fix:        ║');
-    console.error('║  1. Ensure Docker is installed and running                     ║');
-    console.error('║  2. Run: docker info                                           ║');
+    console.error(`║  1. Ensure ${CONTAINER_RUNTIME_BIN} is installed and running              ║`);
+    console.error(`║  2. Run: ${CONTAINER_RUNTIME_BIN} info                                    ║`);
     console.error('║  3. Restart NanoClaw                                           ║');
     console.error('╚════════════════════════════════════════════════════════════════╝\n');
     throw new Error('Container runtime is required but failed to start', {
