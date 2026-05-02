@@ -211,32 +211,6 @@ function killOrphanedProcesses(projectRoot: string): void {
   }
 }
 
-/**
- * Detect stale docker group membership in the user systemd session.
- *
- * When a user is added to the docker group mid-session, the user systemd
- * daemon (user@UID.service) keeps the old group list from login time.
- * Docker works in the terminal but not in the service context.
- *
- * Only relevant on Linux with user-level systemd (not root, not macOS, not WSL nohup).
- */
-function checkDockerGroupStale(): boolean {
-  try {
-    execSync('systemd-run --user --pipe --wait docker info', {
-      stdio: 'pipe',
-      timeout: 10000,
-    });
-    return false; // Docker works from systemd session
-  } catch {
-    // Check if docker works from the current shell (to distinguish stale group vs broken docker)
-    try {
-      execSync('docker info', { stdio: 'pipe', timeout: 5000 });
-      return true; // Works in shell but not systemd session → stale group
-    } catch {
-      return false; // Docker itself is not working, different issue
-    }
-  }
-}
 
 function setupSystemd(
   projectRoot: string,
@@ -293,36 +267,6 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
 
   fs.writeFileSync(unitPath, unit);
   log.info('Wrote systemd unit', { unitPath });
-
-  // Detect stale docker group before starting (user systemd only). The user
-  // systemd manager is a long-running process whose group list is frozen at
-  // login, so `usermod -aG docker` mid-session doesn't reach it. Rather than
-  // require the user to log out + back in, punch a POSIX ACL onto the socket
-  // that grants the current user rw directly. This is temporary — the socket
-  // is recreated by dockerd on restart (and by then the user has relogged, so
-  // normal group perms apply again).
-  let dockerGroupStale = !runningAsRoot && checkDockerGroupStale();
-  if (dockerGroupStale) {
-    log.warn(
-      'Docker group not active in systemd session — user was likely added to docker group mid-session',
-    );
-    if (commandExists('setfacl')) {
-      const user = execSync('whoami', { encoding: 'utf-8' }).trim();
-      try {
-        execSync(`sudo setfacl -m u:${user}:rw /var/run/docker.sock`, {
-          stdio: 'inherit',
-        });
-        log.info(
-          'Applied temporary ACL to /var/run/docker.sock (resets on docker restart or reboot)',
-        );
-        dockerGroupStale = false;
-      } catch (err) {
-        log.warn('Failed to apply setfacl workaround', { err });
-      }
-    } else {
-      log.warn('setfacl not installed — cannot apply automatic workaround');
-    }
-  }
 
   // Kill orphaned nanoclaw processes to avoid channel connection conflicts
   killOrphanedProcesses(projectRoot);

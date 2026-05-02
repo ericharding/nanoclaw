@@ -314,12 +314,7 @@ async function restartService(): Promise<void> {
       );
     } else if (platform === 'linux') {
       const unit = getSystemdUnit();
-      const user = spawnSync('systemctl', ['--user', 'restart', unit], {
-        stdio: 'ignore',
-      });
-      if (user.status !== 0) {
-        spawnSync('sudo', ['systemctl', 'restart', unit], { stdio: 'ignore' });
-      }
+      spawnSync('systemctl', ['--user', 'restart', unit], { stdio: 'ignore' });
     }
     // Give the adapter a moment to connect to signal-cli before
     // init-first-agent's welcome DM hits the delivery path.
