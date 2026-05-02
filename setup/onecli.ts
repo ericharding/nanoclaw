@@ -11,7 +11,7 @@
  * Emits ONECLI_URL and polls /health so downstream steps (auth, service)
  * get a ready gateway.
  */
-import { execFileSync, execSync, spawnSync } from 'child_process';
+import { execFileSync, execSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -118,32 +118,28 @@ function installOnecliCliOnly(): { stdout: string; ok: boolean } {
 
 /**
  * When CONTAINER_RUNTIME=podman and the `docker` binary is absent, the OneCLI
- * gateway installer (which uses docker-compose) will refuse to run. The
- * `podman-docker` package provides a `docker` shim that satisfies the check.
- * Start the podman socket too so docker-compose commands reach podman.
+ * gateway installer (which uses docker-compose) will refuse to run. Returns
+ * false and emits a hint if the prerequisite isn't met.
  */
-function ensureDockerCompatForPodman(): void {
-  if ((process.env.CONTAINER_RUNTIME ?? 'docker') === 'docker') return;
-  if (commandExists('docker')) return;
+function checkDockerCompatForPodman(): boolean {
+  if ((process.env.CONTAINER_RUNTIME ?? 'docker') === 'docker') return true;
+  if (commandExists('docker')) return true;
 
-  log.info('CONTAINER_RUNTIME=podman and docker not found — installing podman-docker shim');
-  const res = spawnSync('sudo', ['apt-get', 'install', '-y', 'podman-docker'], {
-    stdio: 'inherit',
-  });
-  if (res.status !== 0) {
-    log.warn('podman-docker install failed; gateway installer may fail if it requires docker');
-    return;
-  }
-
-  // Activate the podman socket so docker-compose calls reach podman.
-  spawnSync('systemctl', ['--user', 'start', 'podman.socket'], { stdio: 'inherit' });
-  log.info('podman-docker installed and podman socket started');
+  return false;
 }
 
 function installOnecli(): { stdout: string; ok: boolean } {
   let stdout = '';
 
-  ensureDockerCompatForPodman();
+  if (!checkDockerCompatForPodman()) {
+    const hint =
+      'CONTAINER_RUNTIME=podman is set but the OneCLI gateway installer requires the docker binary. ' +
+      'Install the podman-docker compatibility shim first:\n\n' +
+      '  sudo apt-get install -y podman-docker\n  systemctl --user start podman.socket\n\n' +
+      'Then re-run setup.';
+    log.error('OneCLI gateway install failed', { hint });
+    return { stdout: hint, ok: false };
+  }
 
   // Gateway install (docker-compose based, no rate-limit concerns).
   const gw = runInstall('curl -fsSL onecli.sh/install | sh');
