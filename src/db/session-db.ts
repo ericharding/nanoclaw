@@ -139,10 +139,10 @@ export function getMessageForRetry(
   db: Database.Database,
   messageId: string,
   status: string,
-): { id: string; tries: number } | undefined {
-  return db.prepare('SELECT id, tries FROM messages_in WHERE id = ? AND status = ?').get(messageId, status) as
-    | { id: string; tries: number }
-    | undefined;
+): { id: string; tries: number; processAfter: string | null } | undefined {
+  return db
+    .prepare('SELECT id, tries, process_after as processAfter FROM messages_in WHERE id = ? AND status = ?')
+    .get(messageId, status) as { id: string; tries: number; processAfter: string | null } | undefined;
 }
 
 export function syncProcessingAcks(inDb: Database.Database, outDb: Database.Database): void {
@@ -178,6 +178,19 @@ export function getProcessingClaims(outDb: Database.Database): ProcessingClaim[]
   return outDb
     .prepare("SELECT message_id, status_changed FROM processing_ack WHERE status = 'processing'")
     .all() as ProcessingClaim[];
+}
+
+/**
+ * Delete orphan 'processing' rows. Called by the host after killing a
+ * container so the leftover claim doesn't trip claim-stuck on the next sweep
+ * tick (which would kill the freshly respawned container before its
+ * agent-runner can run its own startup cleanup).
+ *
+ * Safe because the host only writes to outbound.db when no container is
+ * running (we just killed it). Returns the number of rows deleted.
+ */
+export function deleteOrphanProcessingClaims(outDb: Database.Database): number {
+  return outDb.prepare("DELETE FROM processing_ack WHERE status = 'processing'").run().changes;
 }
 
 export interface ContainerState {

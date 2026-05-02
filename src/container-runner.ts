@@ -9,7 +9,16 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, ONECLI_API_KEY, ONECLI_URL, TIMEZONE } from './config.js';
+import {
+  CONTAINER_IMAGE,
+  CONTAINER_IMAGE_BASE,
+  CONTAINER_INSTALL_LABEL,
+  DATA_DIR,
+  GROUPS_DIR,
+  ONECLI_API_KEY,
+  ONECLI_URL,
+  TIMEZONE,
+} from './config.js';
 import { readContainerConfig, writeContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
@@ -27,7 +36,13 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
-import { markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
+import {
+  heartbeatPath,
+  markContainerRunning,
+  markContainerStopped,
+  sessionDir,
+  writeSessionRouting,
+} from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
@@ -43,7 +58,7 @@ const activeContainers = new Map<string, { process: ChildProcess; containerName:
  * a duplicate container against the same session directory, producing
  * racy double-replies.
  */
-const wakePromises = new Map<string, Promise<void>>();
+const wakePromises = new Map<string, Promise<boolean>>();
 
 export function getActiveContainerCount(): number {
   return activeContainers.size;
@@ -58,20 +73,32 @@ export function isContainerRunning(sessionId: string): boolean {
  * (the in-flight wake promise is reused).
  *
  * The container runs the v2 agent-runner which polls the session DB.
+ *
+ * Contract: never throws. Returns `true` on successful spawn, `false` on
+ * transient spawn failure (e.g. OneCLI gateway unreachable). Callers don't
+ * need to wrap — the inbound row stays pending and host-sweep retries on
+ * its next tick. Callers that care (e.g. the router's typing indicator)
+ * can branch on the boolean.
  */
-export function wakeContainer(session: Session): Promise<void> {
+export function wakeContainer(session: Session): Promise<boolean> {
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
-    return Promise.resolve();
+    return Promise.resolve(true);
   }
   const existing = wakePromises.get(session.id);
   if (existing) {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
-  const promise = spawnContainer(session).finally(() => {
-    wakePromises.delete(session.id);
-  });
+  const promise = spawnContainer(session)
+    .then(() => true)
+    .catch((err) => {
+      log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+      return false;
+    })
+    .finally(() => {
+      wakePromises.delete(session.id);
+    });
   wakePromises.set(session.id, promise);
   return promise;
 }
@@ -122,6 +149,12 @@ async function spawnContainer(session: Session): Promise<void> {
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
+  // Clear any orphan heartbeat from a previous container instance — the
+  // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
+  // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
+  // immediate kill before the new container touches the file itself.
+  fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
+
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
   activeContainers.set(session.id, { process: container, containerName });
@@ -170,12 +203,31 @@ export function killContainer(sessionId: string, reason: string): void {
   }
 }
 
+/**
+ * Resolve the provider name for a session using the precedence documented in
+ * the provider-install skills:
+ *
+ *   sessions.agent_provider
+ *     → agent_groups.agent_provider
+ *     → container.json `provider`
+ *     → 'claude'
+ *
+ * Pure so the precedence can be unit-tested without a DB or filesystem.
+ */
+export function resolveProviderName(
+  sessionProvider: string | null | undefined,
+  agentGroupProvider: string | null | undefined,
+  containerConfigProvider: string | null | undefined,
+): string {
+  return (sessionProvider || agentGroupProvider || containerConfigProvider || 'claude').toLowerCase();
+}
+
 function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
 ): { provider: string; contribution: ProviderContainerContribution } {
-  const provider = (containerConfig.provider || 'claude').toLowerCase();
+  const provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
   const fn = getProviderContainerConfig(provider);
   const contribution = fn
     ? fn({
@@ -381,7 +433,7 @@ async function buildContainerArgs(
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName];
+  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -395,20 +447,18 @@ async function buildContainerArgs(
   }
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
-  // are routed through the agent vault for credential injection.
-  try {
-    if (agentIdentifier) {
-      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
-    }
-    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-    if (onecliApplied) {
-      log.info('OneCLI gateway applied', { containerName });
-    } else {
-      log.warn('OneCLI gateway not applied — container will have no credentials', { containerName });
-    }
-  } catch (err) {
-    log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
+  // are routed through the agent vault for credential injection. Treated as
+  // a transient hard failure: if we can't wire the gateway, we don't spawn.
+  // The caller (router or host-sweep) catches the throw, leaves the inbound
+  // message pending, and the next sweep tick retries.
+  if (agentIdentifier) {
+    await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
   }
+  const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+  if (!onecliApplied) {
+    throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
+  }
+  log.info('OneCLI gateway applied', { containerName });
 
   // Host gateway
   args.push(...hostGatewayArgs());
@@ -469,7 +519,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   }
   dockerfile += 'USER node\n';
 
-  const imageTag = `nanoclaw-agent:${agentGroupId}`;
+  const imageTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;
 
   log.info('Building per-agent-group image', { agentGroupId, imageTag, apt: aptPackages, npm: npmPackages });
 

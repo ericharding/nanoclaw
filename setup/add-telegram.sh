@@ -144,13 +144,15 @@ cp .env data/env/env
 # non-interactive install.
 
 log "Restarting service so the new adapter picks up the token…"
+# shellcheck source=setup/lib/install-slug.sh
+source "$PROJECT_ROOT/setup/lib/install-slug.sh"
 case "$(uname -s)" in
   Darwin)
-    launchctl kickstart -k "gui/$(id -u)/com.nanoclaw" >&2 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/$(launchd_label)" >&2 2>/dev/null || true
     ;;
   Linux)
-    systemctl --user restart nanoclaw >&2 2>/dev/null \
-      || sudo systemctl restart nanoclaw >&2 2>/dev/null \
+    systemctl --user restart "$(systemd_unit)" >&2 2>/dev/null \
+      || sudo systemctl restart "$(systemd_unit)" >&2 2>/dev/null \
       || true
     ;;
 esac

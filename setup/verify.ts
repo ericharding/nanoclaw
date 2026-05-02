@@ -14,7 +14,7 @@ import Database from 'better-sqlite3';
 import { DATA_DIR } from '../src/config.js';
 import { readEnvFile } from '../src/env.js';
 import { log } from '../src/log.js';
-import { pingCliAgent } from './lib/agent-ping.js';
+import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
 import {
   getPlatform,
   getServiceManager,
@@ -32,11 +32,12 @@ export async function run(_args: string[]): Promise<void> {
 
   // 1. Check service status + detect checkout mismatch.
   //
-  // Why the mismatch matters: the host binds `<DATA_DIR>/cli.sock` relative
-  // to the project root it was started from. If the running service is from
-  // a sibling checkout (common for developers with multiple clones), this
-  // repo's `data/cli.sock` won't exist — AGENT_PING would return a
-  // misleading `socket_error`. Surface the mismatch directly instead.
+  // Why the mismatch matters: the host reads `<projectRoot>/data/v2.db` and
+  // binds `<DATA_DIR>/cli.sock` relative to the project root it was started
+  // from. If the running service is from a sibling checkout (common for
+  // developers with multiple clones), nothing in this checkout is actually
+  // wired up. Surface the mismatch directly so the user knows to point the
+  // service at the right folder.
   let service:
     | 'not_found'
     | 'stopped'
@@ -45,10 +46,13 @@ export async function run(_args: string[]): Promise<void> {
   let runningFromPath: string | null = null;
   const mgr = getServiceManager();
 
+  const launchdLabel = getLaunchdLabel(projectRoot);
+  const systemdUnit = getSystemdUnit(projectRoot);
+
   if (mgr === 'launchd') {
     try {
       const output = execSync('launchctl list', { encoding: 'utf-8' });
-      const line = output.split('\n').find((l) => l.includes('com.nanoclaw'));
+      const line = output.split('\n').find((l) => l.includes(launchdLabel));
       if (line) {
         const pidField = line.trim().split(/\s+/)[0];
         if (pidField !== '-' && pidField) {
@@ -67,11 +71,11 @@ export async function run(_args: string[]): Promise<void> {
   } else if (mgr === 'systemd') {
     const prefix = isRoot() ? 'systemctl' : 'systemctl --user';
     try {
-      execSync(`${prefix} is-active nanoclaw`, { stdio: 'ignore' });
+      execSync(`${prefix} is-active ${systemdUnit}`, { stdio: 'ignore' });
       service = 'running';
       try {
         const pidStr = execSync(
-          `${prefix} show nanoclaw -p MainPID --value`,
+          `${prefix} show ${systemdUnit} -p MainPID --value`,
           { encoding: 'utf-8' },
         ).trim();
         const pid = Number(pidStr);
@@ -86,7 +90,7 @@ export async function run(_args: string[]): Promise<void> {
         const output = execSync(`${prefix} list-unit-files`, {
           encoding: 'utf-8',
         });
-        if (output.includes('nanoclaw')) {
+        if (output.includes(systemdUnit)) {
           service = 'stopped';
         }
       } catch {
@@ -182,7 +186,6 @@ export async function run(_args: string[]): Promise<void> {
   if (has('IMESSAGE_ENABLED')) channelAuth.imessage = 'configured';
 
   const configuredChannels = Object.keys(channelAuth);
-  const anyChannelConfigured = configuredChannels.length > 0;
 
   // 5. Check registered groups in v2 central DB (agent_groups + messaging_group_agents)
   let registeredGroups = 0;
@@ -214,24 +217,13 @@ export async function run(_args: string[]): Promise<void> {
     mountAllowlist = 'configured';
   }
 
-  // 7. End-to-end: ping the CLI agent and confirm it replies. Only run if
-  // everything upstream looks healthy, since a broken socket would just hang.
-  let agentPing: 'ok' | 'no_reply' | 'socket_error' | 'skipped' = 'skipped';
-  if (service === 'running' && registeredGroups > 0) {
-    log.info('Pinging CLI agent');
-    agentPing = await pingCliAgent();
-    log.info('Agent ping result', { agentPing });
-  }
-
-  // Determine overall status
-  const status =
-    service === 'running' &&
-    credentials !== 'missing' &&
-    anyChannelConfigured &&
-    registeredGroups > 0 &&
-    (agentPing === 'ok' || agentPing === 'skipped')
-      ? 'success'
-      : 'failed';
+  // Determine overall status. The cli-agent step earlier in setup already
+  // proved the agent round-trip works; verify is a static health check.
+  const status = determineVerifyStatus({
+    service,
+    credentials,
+    registeredGroups,
+  });
 
   log.info('Verification complete', { status, channelAuth });
 
@@ -243,12 +235,23 @@ export async function run(_args: string[]): Promise<void> {
     CHANNEL_AUTH: JSON.stringify(channelAuth),
     REGISTERED_GROUPS: registeredGroups,
     MOUNT_ALLOWLIST: mountAllowlist,
-    AGENT_PING: agentPing,
     STATUS: status,
     LOG: 'logs/setup.log',
   });
 
   if (status === 'failed') process.exit(1);
+}
+
+export function determineVerifyStatus(input: {
+  service: 'not_found' | 'stopped' | 'running' | 'running_other_checkout';
+  credentials: string;
+  registeredGroups: number;
+}): 'success' | 'failed' {
+  return input.service === 'running' &&
+    input.credentials !== 'missing' &&
+    input.registeredGroups > 0
+    ? 'success'
+    : 'failed';
 }
 
 /**

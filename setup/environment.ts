@@ -7,10 +7,76 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-import { STORE_DIR } from '../src/config.js';
 import { log } from '../src/log.js';
 import { commandExists, getPlatform, isHeadless, isWSL } from './platform.js';
 import { emitStatus } from './status.js';
+
+/**
+ * Read a single key from `.env` on disk (not process.env).
+ * Returns the trimmed value or null if the key isn't set / file doesn't exist.
+ */
+export function readEnvKey(key: string, projectRoot?: string): string | null {
+  const envPath = path.join(projectRoot ?? process.cwd(), '.env');
+  let content: string;
+  try {
+    content = fs.readFileSync(envPath, 'utf-8');
+  } catch {
+    return null;
+  }
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eq = trimmed.indexOf('=');
+    if (eq < 1) continue;
+    if (trimmed.slice(0, eq) === key) {
+      return trimmed.slice(eq + 1).trim() || null;
+    }
+  }
+  return null;
+}
+
+export function detectExistingDisplayName(projectRoot: string): string | null {
+  const dbPath = path.join(projectRoot, 'data', 'v2.db');
+  if (!fs.existsSync(dbPath)) return null;
+
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const row = db
+      .prepare(`SELECT display_name FROM users WHERE id = 'cli:local'`)
+      .get() as { display_name: string } | undefined;
+    return row?.display_name?.trim() || null;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+export function detectRegisteredGroups(projectRoot: string): boolean {
+  if (fs.existsSync(path.join(projectRoot, 'data', 'registered_groups.json'))) {
+    return true;
+  }
+
+  const dbPath = path.join(projectRoot, 'data', 'v2.db');
+  if (!fs.existsSync(dbPath)) return false;
+
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    const row = db
+      .prepare(
+        `SELECT COUNT(DISTINCT ag.id) as count FROM agent_groups ag
+         JOIN messaging_group_agents mga ON mga.agent_group_id = ag.id`,
+      )
+      .get() as { count: number };
+    return row.count > 0;
+  } catch {
+    return false;
+  } finally {
+    db?.close();
+  }
+}
 
 export async function run(_args: string[]): Promise<void> {
   const projectRoot = process.cwd();
@@ -39,26 +105,7 @@ export async function run(_args: string[]): Promise<void> {
   const authDir = path.join(projectRoot, 'store', 'auth');
   const hasAuth = fs.existsSync(authDir) && fs.readdirSync(authDir).length > 0;
 
-  let hasRegisteredGroups = false;
-  // Check JSON file first (pre-migration)
-  if (fs.existsSync(path.join(projectRoot, 'data', 'registered_groups.json'))) {
-    hasRegisteredGroups = true;
-  } else {
-    // Check SQLite directly using better-sqlite3 (no sqlite3 CLI needed)
-    const dbPath = path.join(STORE_DIR, 'messages.db');
-    if (fs.existsSync(dbPath)) {
-      try {
-        const db = new Database(dbPath, { readonly: true });
-        const row = db
-          .prepare('SELECT COUNT(*) as count FROM registered_groups')
-          .get() as { count: number };
-        if (row.count > 0) hasRegisteredGroups = true;
-        db.close();
-      } catch {
-        // Table might not exist yet
-      }
-    }
-  }
+  const hasRegisteredGroups = detectRegisteredGroups(projectRoot);
 
   // Check for existing OpenClaw installation
   const homedir = (await import('os')).homedir();

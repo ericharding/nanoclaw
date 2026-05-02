@@ -11,6 +11,7 @@
  *   - COLORTERM truecolor/24bit  → 24-bit ANSI (exact brand cyan)
  *   - Otherwise                  → kleur's 16-color cyan (closest fallback)
  */
+import * as p from '@clack/prompts';
 import k from 'kleur';
 
 const USE_ANSI = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
@@ -39,6 +40,57 @@ export function brandChip(s: string): string {
 }
 
 /**
+ * Accent green (#3fba50) for emphasizing a single word inside prompt
+ * messages — currently the "you" in "What should your assistant call
+ * you?" so the operator parses at a glance who the question is about.
+ * Same TTY/NO_COLOR/truecolor gating as the rest of the palette.
+ */
+export function accentGreen(s: string): string {
+  if (!USE_ANSI) return s;
+  if (TRUECOLOR) return `\x1b[38;2;63;186;80m${s}\x1b[39m`;
+  return k.green(s);
+}
+
+/**
+ * Format an elapsed-time duration (in milliseconds) for the spinner
+ * suffixes setup writes everywhere. Sub-minute durations stay in plain
+ * seconds (`47s`); once the timer crosses 60 seconds we switch to the
+ * `Xm Ys` form (`2m 34s`) so a long step doesn't read as `247s` or
+ * similar. The format is consistent above 60s — `4m 0s` over `4m` —
+ * so live spinner output doesn't change shape at every whole minute.
+ */
+export function fmtDuration(ms: number): string {
+  const totalSec = Math.round(ms / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = totalSec % 60;
+  return `${m}m ${s}s`;
+}
+
+/**
+ * Brand body color for setup-flow prose. Used for card bodies (via the
+ * `note()` formatter) and `p.log.*` body arguments — anywhere the
+ * previous "dim" treatment was making prose hard to read or washing
+ * out embedded brand emphasis.
+ *
+ * Multi-line input is colored line-by-line so embedded line breaks
+ * don't bleed the SGR sequence across clack's gutter prefix.
+ */
+export function brandBody(s: string): string {
+  if (!USE_ANSI) return s;
+  if (TRUECOLOR) {
+    return s
+      .split('\n')
+      .map((line) => (line.length > 0 ? `\x1b[38;2;43;183;206m${line}\x1b[39m` : line))
+      .join('\n');
+  }
+  return s
+    .split('\n')
+    .map((line) => (line.length > 0 ? k.cyan(line) : line))
+    .join('\n');
+}
+
+/**
  * Wrap text so it fits inside clack's gutter without the terminal's soft
  * wrap breaking the `│ …` bar on long lines. Works on a single string with
  * embedded `\n`s; each logical line is wrapped independently.
@@ -58,17 +110,24 @@ export function wrapForGutter(text: string, gutter: number): string {
 }
 
 /**
- * Wrap + dim together. Needed instead of `k.dim(wrapForGutter(...))`
- * because clack resets styling at each line break when rendering
- * multi-line log content — a single outer dim envelope only colors the
- * first line. Applying dim per-line gives each wrapped row its own
- * `\x1b[2m…\x1b[0m` envelope so the whole block reads as one block.
+ * Wrap multi-line explanatory prose to the clack gutter. Previously
+ * dimmed its output (hence the name) — that made body copy hard to read
+ * against dark terminals. Dim is now reserved for preview/debug blocks
+ * (failure transcript tails, claude-assist streams); prose renders at
+ * the terminal's regular weight.
  */
 export function dimWrap(text: string, gutter: number): string {
-  return wrapForGutter(text, gutter)
-    .split('\n')
-    .map((line) => k.dim(line))
-    .join('\n');
+  return wrapForGutter(text, gutter);
+}
+
+/**
+ * Wrap clack's `p.note` so card bodies render in the brand body color
+ * (#2b6fdc) instead of clack's default dim. Clack runs the formatter
+ * on each line individually, so `brandBody` colors each line cleanly
+ * without bleeding across the gutter prefix.
+ */
+export function note(message: string, title?: string): void {
+  p.note(message, title, { format: brandBody });
 }
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;

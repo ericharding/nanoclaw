@@ -20,7 +20,7 @@ import k from 'kleur';
 import * as setupLog from '../logs.js';
 import { offerClaudeAssist } from './claude-assist.js';
 import { emit as phEmit } from './diagnostics.js';
-import { fitToWidth } from './theme.js';
+import { brandBody, fitToWidth, fmtDuration } from './theme.js';
 
 export type Fields = Record<string, string>;
 export type Block = { type: string; fields: Fields };
@@ -102,12 +102,19 @@ export class StatusStream {
  * raw log file (level 3) and parsed for status blocks (level 2 summary).
  * The onBlock callback fires per status block as they close so the UI can
  * react mid-stream.
+ *
+ * `onLine`, if provided, fires for every line from stdout + stderr (minus
+ * status-block control lines) so callers can render a rolling tail. Status
+ * block lines are still parsed by the `StatusStream` — they're just
+ * excluded from the line feed so they don't fill the user-facing window
+ * with `=== NANOCLAW SETUP: …` noise.
  */
 export function spawnStep(
   stepName: string,
   extra: string[],
   onBlock: (block: Block) => void,
   rawLogPath: string,
+  onLine?: (line: string) => void,
 ): Promise<StepResult> {
   return new Promise((resolve) => {
     const args = ['exec', 'tsx', 'setup/index.ts', '--step', stepName];
@@ -118,13 +125,34 @@ export function spawnStep(
     const raw = fs.createWriteStream(rawLogPath, { flags: 'w' });
     raw.write(`# ${stepName} — ${new Date().toISOString()}\n\n`);
 
+    // Per-line forwarder for the optional onLine callback. We keep our own
+    // buffer (separate from StatusStream's) so the parser still gets raw
+    // chunks and isn't forced through a line-by-line path it doesn't need.
+    let lineBuf = '';
+    const pushLines = (chunk: string): void => {
+      if (!onLine) return;
+      lineBuf += chunk;
+      let idx: number;
+      while ((idx = lineBuf.indexOf('\n')) !== -1) {
+        const line = lineBuf.slice(0, idx).replace(/\r/g, '');
+        lineBuf = lineBuf.slice(idx + 1);
+        if (line.startsWith('=== NANOCLAW SETUP:')) continue;
+        if (line.startsWith('=== END ===')) continue;
+        if (line.trim()) onLine(line);
+      }
+    };
+
     child.stdout.on('data', (chunk: Buffer) => {
-      stream.write(chunk.toString('utf-8'));
+      const s = chunk.toString('utf-8');
+      stream.write(s);
       raw.write(chunk);
+      pushLines(s);
     });
     child.stderr.on('data', (chunk: Buffer) => {
-      stream.transcript += chunk.toString('utf-8');
+      const s = chunk.toString('utf-8');
+      stream.transcript += s;
       raw.write(chunk);
+      pushLines(s);
     });
 
     child.on('close', (code) => {
@@ -279,25 +307,25 @@ async function runUnderSpinner<
 ): Promise<T> {
   const s = p.spinner();
   const start = Date.now();
-  s.start(fitToWidth(labels.running, ' (999s)'));
+  s.start(fitToWidth(labels.running, ' (99m 59s)'));
   const tick = setInterval(() => {
-    const elapsed = Math.round((Date.now() - start) / 1000);
-    const suffix = ` (${elapsed}s)`;
+    const suffix = ` (${fmtDuration(Date.now() - start)})`;
     s.message(`${fitToWidth(labels.running, suffix)}${k.dim(suffix)}`);
   }, 1000);
 
   const result = await work();
 
   clearInterval(tick);
-  const elapsed = Math.round((Date.now() - start) / 1000);
-  const suffix = ` (${elapsed}s)`;
+  const suffix = ` (${fmtDuration(Date.now() - start)})`;
   if (result.ok) {
     const isSkipped = result.terminal?.fields.STATUS === 'skipped';
     const msg = isSkipped && labels.skipped ? labels.skipped : labels.done;
-    s.stop(`${fitToWidth(msg, suffix)}${k.dim(suffix)}`);
+    // Bold the outcome so the step's headline reads stronger than the prose
+    // body copy around it. The trailing `(Ns)` timing stays dim.
+    s.stop(`${k.bold(fitToWidth(msg, suffix))}${k.dim(suffix)}`);
   } else {
     const failMsg = labels.failed ?? labels.running.replace(/…$/, ' failed');
-    s.stop(`${fitToWidth(failMsg, suffix)}${k.dim(suffix)}`, 1);
+    s.stop(`${k.bold(fitToWidth(failMsg, suffix))}${k.dim(suffix)}`, 1);
     dumpTranscriptOnFailure(result.transcript);
   }
   return result;
@@ -360,7 +388,7 @@ export async function fail(
       const skipList = [
         ...new Set([...existingSkip, ...setupLog.completedStepNames()]),
       ].join(',');
-      p.log.step(`Retrying from ${stepName}…`);
+      p.log.step(brandBody(`Retrying from ${stepName}…`));
       const result = spawnSync('pnpm', ['--silent', 'run', 'setup:auto'], {
         stdio: 'inherit',
         env: { ...process.env, NANOCLAW_SKIP: skipList },

@@ -56,6 +56,8 @@ export interface InboundEvent {
      * See InboundMessage.isMention for the full explanation.
      */
     isMention?: boolean;
+    /** True when the source is a group/channel thread, false for DMs. */
+    isGroup?: boolean;
   };
   replyTo?: DeliveryAddress;
 }
@@ -81,6 +83,8 @@ export interface InboundMessage {
    * router falls back to text-match against agent_group_name.
    */
   isMention?: boolean;
+  /** True when the source is a group/channel thread, false for DMs. */
+  isGroup?: boolean;
 }
 
 /** A file attachment to deliver alongside a message. */
@@ -131,6 +135,7 @@ export interface ChannelAdapter {
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
+  resolveChannelName?(platformId: string): Promise<string | null>;
 
   /**
    * Subscribe the bot to a thread so follow-up messages route via the

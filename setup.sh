@@ -120,6 +120,20 @@ install_deps() {
       || true
   fi
 
+  # `npm install -g` writes to npm's global prefix, which isn't always on the
+  # shell PATH — common on macOS where the user has `npm config set prefix
+  # ~/.npm-global` to avoid sudo, or on Linux where /usr/local/bin isn't in
+  # PATH. Discover the prefix and prepend its bin dir so `command -v pnpm`
+  # sees the new install.
+  if ! command -v pnpm >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    local npm_prefix
+    npm_prefix=$(npm config get prefix 2>/dev/null)
+    if [ -n "$npm_prefix" ] && [ -x "$npm_prefix/bin/pnpm" ]; then
+      export PATH="$npm_prefix/bin:$PATH"
+      log "Prepended npm prefix bin to PATH: $npm_prefix/bin"
+    fi
+  fi
+
   if ! command -v pnpm >/dev/null 2>&1; then
     log "pnpm not on PATH after corepack + npm fallback"
     return
