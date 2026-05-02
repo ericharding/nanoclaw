@@ -11,10 +11,13 @@ import { getDefaultContainerImage } from '../src/install-slug.js';
 import { commandExists, getPlatform } from './platform.js';
 import { emitStatus } from './status.js';
 
-type DockerStatus = 'ok' | 'no-permission' | 'no-daemon' | 'other';
+type RuntimeStatus = 'ok' | 'no-permission' | 'no-daemon' | 'other';
 
-function dockerStatus(): DockerStatus {
-  const res = spawnSync('docker', ['info'], { encoding: 'utf-8' });
+const SUPPORTED_RUNTIMES = ['docker', 'podman'] as const;
+type SupportedRuntime = (typeof SUPPORTED_RUNTIMES)[number];
+
+function runtimeStatus(bin: string): RuntimeStatus {
+  const res = spawnSync(bin, ['info'], { encoding: 'utf-8' });
   if (res.status === 0) return 'ok';
   const err = `${res.stderr ?? ''}\n${res.stdout ?? ''}`;
   if (/permission denied/i.test(err)) return 'no-permission';
@@ -22,26 +25,32 @@ function dockerStatus(): DockerStatus {
   return 'other';
 }
 
-function dockerRunning(): boolean {
-  return dockerStatus() === 'ok';
-}
-
 /**
- * Try to start Docker if it's installed but idle. Poll up to 60s for the
- * daemon to come up — but bail immediately if the socket is reachable and
- * only blocked by a group-permission error, since that won't resolve by
- * waiting (the caller handles the sg re-exec for that case).
+ * Try to start the container runtime if it's installed but idle. Poll up to
+ * 60s for the daemon to come up — but bail immediately if the socket is
+ * reachable and only blocked by a group-permission error (Docker only), since
+ * that won't resolve by waiting.
  */
-async function tryStartDocker(): Promise<DockerStatus> {
+async function tryStartRuntime(runtime: string): Promise<RuntimeStatus> {
   const platform = getPlatform();
-  log.info('Docker not running — attempting to start', { platform });
+  log.info(`${runtime} not running — attempting to start`, { platform });
 
   try {
-    if (platform === 'macos') {
-      execSync('open -a Docker', { stdio: 'ignore' });
-    } else if (platform === 'linux') {
-      // Inherit stdio so sudo can prompt for a password if needed.
-      execSync('sudo systemctl start docker', { stdio: 'inherit' });
+    if (runtime === 'docker') {
+      if (platform === 'macos') {
+        execSync('open -a Docker', { stdio: 'ignore' });
+      } else if (platform === 'linux') {
+        execSync('sudo systemctl start docker', { stdio: 'inherit' });
+      } else {
+        return 'other';
+      }
+    } else if (runtime === 'podman') {
+      if (platform === 'linux') {
+        // Podman is rootless; start the user socket unit.
+        execSync('systemctl --user start podman.socket', { stdio: 'inherit' });
+      } else {
+        return 'other';
+      }
     } else {
       return 'other';
     }
@@ -52,24 +61,23 @@ async function tryStartDocker(): Promise<DockerStatus> {
 
   for (let i = 0; i < 30; i++) {
     await sleep(2000);
-    const s = dockerStatus();
+    const s = runtimeStatus(runtime);
     if (s === 'ok') {
-      log.info('Docker is up');
+      log.info(`${runtime} is up`);
       return 'ok';
     }
     if (s === 'no-permission') {
-      log.info('Docker daemon is up but socket is not accessible (group membership)');
+      log.info(`${runtime} daemon is up but socket is not accessible (group membership)`);
       return 'no-permission';
     }
   }
-  log.warn('Docker did not become ready within 60s');
+  log.warn(`${runtime} did not become ready within 60s`);
   return 'no-daemon';
 }
 
 function parseArgs(args: string[]): { runtime: string } {
-  // `--runtime` is still accepted for backwards compatibility with the /setup
-  // skill, but `docker` is the only supported value.
-  let runtime = 'docker';
+  // Precedence: --runtime flag > CONTAINER_RUNTIME env > 'docker'
+  let runtime = process.env.CONTAINER_RUNTIME || 'docker';
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--runtime' && args[i + 1]) {
       runtime = args[i + 1];
@@ -85,7 +93,7 @@ export async function run(args: string[]): Promise<void> {
   const image = getDefaultContainerImage(projectRoot);
   const logFile = path.join(projectRoot, 'logs', 'setup.log');
 
-  if (runtime !== 'docker') {
+  if (!SUPPORTED_RUNTIMES.includes(runtime as SupportedRuntime)) {
     emitStatus('SETUP_CONTAINER', {
       RUNTIME: runtime,
       IMAGE: image,
@@ -98,16 +106,21 @@ export async function run(args: string[]): Promise<void> {
     process.exit(4);
   }
 
-  if (!commandExists('docker')) {
-    log.info('Docker not found — running setup/install-docker.sh');
-    try {
-      execSync('bash setup/install-docker.sh', { cwd: projectRoot, stdio: 'inherit' });
-    } catch (err) {
-      log.warn('install-docker.sh failed', { err });
+  // Only attempt to auto-install Docker; Podman must be installed by the user.
+  if (!commandExists(runtime)) {
+    if (runtime === 'docker') {
+      log.info('Docker not found — running setup/install-docker.sh');
+      try {
+        execSync('bash setup/install-docker.sh', { cwd: projectRoot, stdio: 'inherit' });
+      } catch (err) {
+        log.warn('install-docker.sh failed', { err });
+      }
+    } else {
+      log.warn(`${runtime} not found — please install it before running setup`);
     }
   }
 
-  if (!commandExists('docker')) {
+  if (!commandExists(runtime)) {
     emitStatus('SETUP_CONTAINER', {
       RUNTIME: runtime,
       IMAGE: image,
@@ -121,20 +134,21 @@ export async function run(args: string[]): Promise<void> {
   }
 
   {
-    let status = dockerStatus();
+    let status = runtimeStatus(runtime);
     if (status !== 'ok') {
-      status = await tryStartDocker();
+      status = await tryStartRuntime(runtime);
     }
 
-    // Socket is unreachable due to group perms — current shell's supplementary
-    // groups are fixed at login, so `usermod -aG docker` doesn't affect us
-    // until next login. Ensure the user is in the docker group (install-docker.sh
-    // does this on fresh installs, but skips when Docker is already present),
-    // then re-exec under `sg docker` so the child picks up docker as its
-    // primary group and can talk to /var/run/docker.sock without a logout.
-    if (status === 'no-permission' && getPlatform() === 'linux' && commandExists('sg')) {
-      // Ensure the current user is in the docker group — without this,
-      // sg will ask for the (typically unset) group password and fail.
+    // Docker on Linux: socket is unreachable due to group perms — current
+    // shell's supplementary groups are fixed at login, so `usermod -aG docker`
+    // doesn't affect us until next login. Re-exec under `sg docker`.
+    // Podman is rootless by default — no group membership required.
+    if (
+      runtime === 'docker' &&
+      status === 'no-permission' &&
+      getPlatform() === 'linux' &&
+      commandExists('sg')
+    ) {
       const inGroup = spawnSync('id', ['-nG'], { encoding: 'utf-8' });
       if (!(inGroup.stdout ?? '').split(/\s+/).includes('docker')) {
         log.info('Adding current user to docker group');
@@ -168,8 +182,8 @@ export async function run(args: string[]): Promise<void> {
     }
   }
 
-  const buildCmd = 'docker build';
-  const runCmd = 'docker';
+  const buildCmd = `${runtime} build`;
+  const runCmd = runtime;
 
   // Build-args from .env. Only INSTALL_CJK_FONTS is passed through today.
   // Keeps /setup and ./container/build.sh in sync — both read the same source.
