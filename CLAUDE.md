@@ -172,6 +172,8 @@ Show the output and wait for approval. Installation-specific files (group files,
 
 Run commands directly — don't tell the user to run them.
 
+Never run `apt-get install`, `brew install`, or any system package manager. If a prerequisite is missing, emit a clear error with the exact command(s) the user should run, then fail so they can install and retry.
+
 ```bash
 # Host (Node + pnpm)
 pnpm run dev          # Host with hot reload
